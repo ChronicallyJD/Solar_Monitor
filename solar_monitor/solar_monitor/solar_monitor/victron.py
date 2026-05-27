@@ -109,16 +109,40 @@ _CHARGER_STATES: dict[int, str] = {
 }
 
 _INVERTER_STATES: dict[int, str] = {
-    0: "Off", 1: "Low Power", 2: "Fault", 9: "Inverting", 255: "Unavailable",
+    0:   "Off",
+    1:   "Low Power",
+    2:   "Fault",
+    3:   "Bulk",
+    4:   "Absorption",
+    5:   "Float",
+    6:   "Storage",
+    7:   "Equalize",
+    8:   "Passthrough",
+    9:   "Inverting",
+    10:  "Power Assist",
+    11:  "Power Supply",
+    246: "Sustain",
+    247: "External Control",
+    252: "Hub-1",
+    253: "Charge",
+    255: "Unavailable",
 }
 
 # Record types whose decrypted byte [0] is a charger/inverter state code.
-# For other types (BMV, DC meter etc.) byte [0] has a different meaning.
-_RECORDS_WITH_STATE: set[int] = {0x01, 0x03, 0x06, 0x07, 0x0B, 0x0C}
+# Used as a sanity check: if the byte is not a recognised value we assume
+# the decryption key is wrong and try the next candidate.
+#
+# 0x0C (VE.Bus) is intentionally EXCLUDED. The MultiPlus-II uses many
+# operating states (0x08=Passthrough, 0x0A=Power Assist, 0xFD=Charge,
+# 0xF7=External Control, …) that are not in _VALID_STATES, causing the
+# record to be falsely rejected and the 0x07 fallback parser to run on
+# the 0x0C ciphertext — producing completely wrong readings.
+# _parse_vebus does its own length plausibility check instead.
+_RECORDS_WITH_STATE: set[int] = {0x01, 0x03, 0x06, 0x07, 0x0B}
 
-# Valid charger/inverter state codes (byte [0] of decrypted payload)
-_VALID_STATES: set[int] = {0, 1, 2, 3, 4, 5, 7, 9, 252, 255}
-
+# Known-valid charger/inverter state bytes for the records above.
+_VALID_STATES: set[int] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                            246, 247, 252, 253, 255}
 
 # ── Advertisement extraction ──────────────────────────────────────────────────
 
