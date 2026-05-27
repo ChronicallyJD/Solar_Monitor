@@ -263,14 +263,16 @@ def _parse_inverter(dec: bytes) -> dict:
                             used as fallback if fine-grained field is N/A)
       [7-10] bit-packed uint32 LE:
                bits  0-14: ac_voltage  (0.01 V per bit; 0x7FFF = N/A)
-               bits 15-25: ac_current  (0.1 A per bit;  0x7FF  = N/A)
+               bits 15-25: ac_current  (0.4 A per bit;  0x7FF  = N/A)
 
     AC apparent power is COMPUTED as ac_voltage * ac_current (no dedicated
     power field exists in this record type).
 
-    Note on field [5:6]: this is a coarser 1V-resolution reading of the same
-    AC voltage.  It is NOT the AC power field, despite appearing first.
-    The previous version of this parser had these assignments swapped.
+    Note on current scale: the Victron spec document states 0.1A per bit,
+    but live comparison against VictronConnect readings on a 48V/2400W unit
+    showed consistently 25% of the correct wattage with that scale. Empirical
+    analysis confirmed 0.4A per bit: raw=26 * 0.4 = 10.4A * 143.36V = 1490.9W
+    matches VictronConnect exactly.
     """
     if len(dec) < 7:
         raise ValueError(f"Inverter record too short ({len(dec)}B, need 7)")
@@ -281,7 +283,11 @@ def _parse_inverter(dec: bytes) -> dict:
 
     word     = struct.unpack_from("<I", dec, 7)[0] if len(dec) >= 11 else 0
     ac_v_raw = word & 0x7FFF          # bits 0-14, 0.01V per bit
-    ac_i_raw = (word >> 15) & 0x7FF  # bits 15-25, 0.1A per bit
+    ac_i_raw = (word >> 15) & 0x7FF  # bits 15-25, 0.4A per bit
+    # NOTE: Current scale is 0.4A per bit (empirically confirmed against
+    # VictronConnect live readings). The Victron spec document states 0.1A,
+    # but using that scale produces exactly 25% of the correct wattage.
+    # 0.4A/bit x raw=26 = 10.4A; 10.4A x 143.36V = 1490.9W matches VC.
 
     batt_v = None if batt_mV     == 0xFFFF else round(batt_mV     * 0.001, 3)
     # Prefer fine-grained voltage (0.01V); fall back to coarse (1V)
@@ -291,7 +297,7 @@ def _parse_inverter(dec: bytes) -> dict:
         ac_v = float(ac_v_coarse)
     else:
         ac_v = None
-    ac_i = None if ac_i_raw == 0x7FF else round(ac_i_raw * 0.1, 2)
+    ac_i = None if ac_i_raw == 0x7FF else round(ac_i_raw * 0.4, 2)  # 0.4A per bit
 
     # Compute apparent power from V * I (no dedicated power field in this record)
     ac_va = round(ac_v * ac_i, 1) if (ac_v is not None and ac_i is not None) else None
