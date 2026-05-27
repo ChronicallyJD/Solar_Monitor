@@ -633,6 +633,144 @@ def _parse_dcenergy(dec: bytes) -> dict:
     }
 
 
+def _parse_vebus(dec: bytes) -> dict:
+    """
+    Parse record type 0x0C — VE.Bus (VE.Bus Smart Dongle).
+
+    This is the richest Victron BLE record: the VE.Bus Smart Dongle plugged
+    into a MultiPlus-II (or any VE.Bus inverter/charger) broadcasts battery
+    voltage, battery current, temperature, SoC, active AC input, AC input
+    real power, AC output real power, alarm level, and device state — all in
+    a single 160-bit (20-byte) encrypted payload.
+
+    Confirmed device
+    ----------------
+    The installation uses a Victron VE.Bus Smart Dongle attached to a
+    MultiPlus-II 48/5000/70-95 120V. The dongle broadcasts this record type
+    as its PRIMARY advertisement. The MultiPlus-II also has built-in Bluetooth
+    that broadcasts record 0x07 with limited data; both may be active
+    simultaneously on different MAC addresses.
+
+    Layout per official Victron spec (2022-12-14)
+    ─────────────────────────────────────────────
+    All bit offsets are relative to byte 0 of the decrypted payload.
+    (The spec quotes offsets from bit 32 of the full record header; subtract
+    32 to get decrypted-payload-relative offsets used here.)
+
+    Offset  Bits  Field               Units   Scale   NA      Register
+    ──────  ────  ──────────────────  ──────  ──────  ──────  ─────────────────────────
+         0     8  device_state        —       —       0xFF    VE_REG_DEVICE_STATE
+         8     8  vebus_error         —       —       0xFF    VE_REG_VEBUS_VEBUS_ERROR
+        16    16  battery_current     A       0.1A    0x7FFF  VE_REG_DC_CHANNEL1_CURRENT (signed int16)
+        32    14  battery_voltage     V       0.01V   0x3FFF  VE_REG_DC_CHANNEL1_VOLTAGE
+        46     2  active_ac_in        —       —       0x3     VE_REG_AC_IN_ACTIVE
+                                                              0=AC1, 1=AC2, 2=not connected, 3=unknown
+        48    19  ac_in_power         W       1W      0x3FFFF VE_REG_AC_IN_{1,2}_REAL_POWER (signed int19)
+        67    19  ac_out_power        W       1W      0x3FFFF VE_REG_AC_OUT_REAL_POWER (signed int19)
+        86     2  alarm               —       —       3       VE_REG_ALARM_NOTIFICATION
+                                                              0=ok, 1=warning, 2=alarm
+        88     7  battery_temperature °C      1°C     0x7F    VE_REG_BAT_TEMPERATURE (raw - 40)
+        95     7  soc                 %       1%      0x7F    VE_REG_SOC (0..126%)
+       102    26  (unused)
+
+    Notes on signed fields
+    ----------------------
+    battery_current (int16):  positive = charging, negative = discharging.
+    ac_in_power (int19):      positive = consuming from grid, negative = feeding to grid.
+    ac_out_power (int19):     positive = delivering to loads, negative = (unusual).
+    Both signed fields use two's complement within their field width.
+
+    NA handling
+    -----------
+    Fields returning NA sentinel values are mapped to None. Each sentinel is
+    the all-ones pattern for its field width (0xFF for 8-bit, 0x7FFF for 16-bit
+    signed, 0x3FFF for 14-bit, 0x3FFFF for 19-bit signed, 0x7F for 7-bit).
+    The alarm field uses 3 (0b11) as NA.
+
+    Source
+    ------
+    - Victron "Extra Manufacturer Data" specification, rev 2022-12-14
+      https://wiki.victronenergy.com/rend/ble/extra_manufacturer_data
+    """
+    if len(dec) < 13:
+        raise ValueError(
+            f"VE.Bus 0x0C record too short ({len(dec)}B, need 13)"
+        )
+
+    val = int.from_bytes(dec, "little")
+
+    def _u(start: int, n: int) -> int:
+        return (val >> start) & ((1 << n) - 1)
+
+    def _s(start: int, n: int) -> int:
+        """Unsigned extraction + two's-complement sign extension."""
+        v = _u(start, n)
+        if v & (1 << (n - 1)):
+            v -= 1 << n
+        return v
+
+    state        = _u(0,  8)
+    vebus_err    = _u(8,  8)
+    batt_cur_r   = _u(16, 16)   # read as unsigned first for NA check
+    batt_v_r     = _u(32, 14)
+    active_ac    = _u(46,  2)
+    ac_in_r      = _u(48, 19)   # unsigned for NA check
+    ac_out_r     = _u(67, 19)   # unsigned for NA check
+    alarm_raw    = _u(86,  2)
+    temp_r       = _u(88,  7)
+    soc_r        = _u(95,  7)
+
+    # Sign-extend after NA check
+    def _sign16(v: int) -> int:
+        return v - 0x10000 if v & 0x8000 else v
+
+    def _sign19(v: int) -> int:
+        return v - 0x80000 if v & 0x40000 else v
+
+    batt_a   = None if batt_cur_r == 0x7FFF else round(_sign16(batt_cur_r) * 0.1,  2)
+    batt_v   = None if batt_v_r   == 0x3FFF else round(batt_v_r            * 0.01, 2)
+    ac_in_w  = None if ac_in_r    == 0x3FFFF else _sign19(ac_in_r)
+    ac_out_w = None if ac_out_r   == 0x3FFFF else _sign19(ac_out_r)
+    alarm    = None if alarm_raw  == 3       else alarm_raw   # 0=ok,1=warn,2=alarm
+    batt_tc  = None if temp_r     == 0x7F    else temp_r - 40
+    soc      = None if soc_r      == 0x7F    else soc_r
+    batt_w   = (round(batt_v * batt_a, 1)
+                if batt_v is not None and batt_a is not None else None)
+
+    _AC_IN = {0: "AC1", 1: "AC2", 2: "Not connected", 3: None}
+    ac_in_label = _AC_IN.get(active_ac)
+
+    _ALARM_STR = {0: None, 1: "Warning", 2: "Alarm"}
+    alarm_str = _ALARM_STR.get(alarm_raw, None)
+
+    log.debug(
+        f"  [VE.Bus 0x0C] dec={dec.hex()}  "
+        f"state=0x{state:02X}  err=0x{vebus_err:02X}  "
+        f"batt={batt_v}V/{batt_a}A/{batt_w}W  "
+        f"ac_in={ac_in_label}@{ac_in_w}W  ac_out={ac_out_w}W  "
+        f"alarm={alarm_str}  temp={batt_tc}°C  soc={soc}%"
+    )
+
+    return {
+        # DC side
+        "voltage_v":            batt_v,
+        "current_a":            batt_a,
+        "power_w":              batt_w,
+        "capacity_pct":         soc,
+        "temperature_c":        batt_tc,
+        # AC side
+        "ac_in_power_w":        ac_in_w,
+        "ac_in_source":         ac_in_label,
+        "ac_out_power_va":      ac_out_w,   # spec gives real W; VA field reused
+        "ac_out_current_a":     None,        # not in VE.Bus record
+        "ac_out_voltage_v":     None,        # not in VE.Bus record
+        # Status
+        "inverter_state":       _INVERTER_STATES.get(state, f"0x{state:02X}"),
+        "vebus_error":          vebus_err if vebus_err != 0xFF else None,
+        "alarm_reason":         alarm_str,
+    }
+
+
 # Dispatch table: record_type -> parser function
 # Mapping based on:
 #  - Official Victron "Extra Manufacturer Data" spec (2022-12-14 PDF)
@@ -647,12 +785,8 @@ def _parse_dcenergy(dec: bytes) -> dict:
 #                                                  0x0D DC Energy Meter
 #                                                  0x0E Orion XS
 #
-# Note on 0x07: Fabian-Schmidt's ESPHome component lists 0x07 as "AC Charger"
-# in current firmware (the 2022 spec called it "GX-Device TBD"). However, the
-# 48V/2400W device in this installation broadcasts 0x07 with a layout that
-# matches NEITHER the 0x03 Inverter spec NOR the 0x08 spec. The parser
-# _parse_inverter_0x07 extracts the three confirmed fields (state, battery V,
-# AC out V) and leaves power/current as None pending live cross-reference.
+# 0x0C now has a dedicated parser (_parse_vebus) derived from the official spec.
+# 0x07 is the older/fallback dongle layout; see _parse_inverter_0x07 for details.
 PARSERS: dict[int, callable] = {
     0x01: _parse_solar,           # Solar Charger (MPPT)
     0x02: _parse_bmv,             # Battery Monitor (SmartShunt, BMV-712/702)
@@ -660,11 +794,11 @@ PARSERS: dict[int, callable] = {
     0x04: _parse_bmv,             # DC/DC Converter (BMV-like layout)
     0x05: _parse_bmv,             # SmartLithium (BMV-like layout)
     0x06: _parse_inverter_rs,     # Inverter RS
-    0x07: _parse_inverter_0x07,   # Newer firmware variant — empirical layout
+    0x07: _parse_inverter_0x07,   # VE.Bus Smart Dongle (older/fallback firmware)
     0x08: _parse_dcenergy,        # AC Charger / SmartShunt IP65
     0x09: _parse_bmv,             # Smart Battery Protect
     0x0B: _parse_inverter_rs,     # Multi RS (same layout as Inverter RS)
-    0x0C: _parse_inverter,        # VE.Bus (same as Inverter)
+    0x0C: _parse_vebus,           # VE.Bus Smart Dongle — full spec layout
     0x0D: _parse_dcenergy,        # DC Energy Meter
     0x0E: _parse_bmv,             # Orion XS (BMV-like layout)
 }

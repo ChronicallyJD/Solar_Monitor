@@ -2,11 +2,19 @@
 output = dashboard.html
 interval = 30
 scan_timeout = 10
-max_history = 60
+max_history = 600
 log_level = INFO
 theme = business
 
 [bms]
+# House Bank = AA:BB:CC:DD:EE:FF : 123456
 
 [victron]
-# Name = MAC:KEY [ type=mppt|inverter|monitor|dcdc ]
+# Format: Name = MAC : KEY  [ type=mppt|inverter|monitor|dcdc ]
+# See CONFIG.md for full instructions including VE.Bus Smart Dongle setup.
+#
+# SmartSolar MPPT example:
+# South Array = 11:22:33:44:55:01 : aabbccddeeff00112233445566778899  type=mppt
+#
+# VE.Bus Smart Dongle (MultiPlus-II) — provides battery V/A/W/temp/SoC + AC in/out real watts:
+# MultiPlus = C0:FF:EE:12:34:56 : 0123456789abcdef0123456789abcdef  type=inverter

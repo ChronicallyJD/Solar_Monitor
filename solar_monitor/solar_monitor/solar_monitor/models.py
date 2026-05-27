@@ -51,10 +51,16 @@ class DeviceReading:
     charger_state:   Optional[str]   = None   # "Off" / "Bulk" / "Absorption" / "Float" etc.
 
     # Inverter fields
-    ac_out_power_va:  Optional[float] = None  # AC apparent output power
+    ac_out_power_va:  Optional[float] = None  # AC output power (real W for VE.Bus, VA for others)
     ac_out_voltage_v: Optional[float] = None  # AC output voltage
     ac_out_current_a: Optional[float] = None  # AC output current
     inverter_state:   Optional[str]   = None  # "Off" / "Inverting" / "Fault" etc.
+
+    # VE.Bus Smart Dongle exclusive fields (record 0x0C)
+    ac_in_power_w:    Optional[float] = None  # AC input real power (W); +ve = from grid
+    ac_in_source:     Optional[str]   = None  # "AC1", "AC2", "Not connected"
+    vebus_error:      Optional[int]   = None  # VE.Bus error code (0 = no error)
+    temperature_c:    Optional[float] = None  # Battery temperature from dongle (°C)
 
     # MultiPlus-II 0x07 record diagnostic — byte[8] of decrypted payload.
     # Empirically varies with AC load but scale is not yet determined.

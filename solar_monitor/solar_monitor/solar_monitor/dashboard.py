@@ -478,85 +478,105 @@ def render_victron_card(r: DeviceReading) -> str:
         err_note = f'<div class="error-msg" style="margin-top:8px">⚠ {r.error}</div>' if r.error else ""
 
         if r.device_type == "inverter":
-            # Complete alarm bitmask per Victron spec
+            # Complete alarm bitmask per Victron spec (used for 0x03/0x07 records)
             _ALARM_BITS = {
-                0:  "Low Batt V",
-                1:  "High Batt V",
-                2:  "Low SOC",
-                3:  "Low Starter V",
-                4:  "High Starter V",
-                5:  "Low Temp",
-                6:  "High Temp",
-                7:  "Mid Voltage",
-                8:  "Overload",
-                9:  "DC Ripple",
-                10: "Low AC Out V",
-                11: "High AC Out V",
-                12: "Short Circuit",
-                13: "BMS Lockout",
+                0: "Low Batt V", 1: "High Batt V", 2: "Low SOC",
+                3: "Low Starter V", 4: "High Starter V", 5: "Low Temp",
+                6: "High Temp", 7: "Mid Voltage", 8: "Overload",
+                9: "DC Ripple", 10: "Low AC Out V", 11: "High AC Out V",
+                12: "Short Circuit", 13: "BMS Lockout",
             }
-            alarm_val  = r.alarm_reason or 0
-            alarms     = [label for bit, label in sorted(_ALARM_BITS.items())
-                          if alarm_val & (1 << bit)]
-            alarm_str  = ", ".join(alarms) if alarms else "None"
-            alarm_color = "var(--red)" if alarms else "var(--green)"
 
-            state_str  = r.inverter_state or "—"
+            state_str = r.inverter_state or "—"
 
-            # If AC power is None but raw_load_indicator is present (0x07 record),
-            # show it so the user can calibrate against VictronConnect.
-            if r.ac_out_power_va is not None:
-                power_display = _fmt(r.ac_out_power_va, 0)
-                power_label   = "AC Out VA"
-            elif r.raw_load_indicator is not None:
-                power_display = f"~{r.raw_load_indicator}"
-                power_label   = "Load (raw)"
+            # ── VE.Bus Smart Dongle (record 0x0C) — richest data ──────────────
+            if r.ac_in_source is not None or r.ac_in_power_w is not None:
+                # AC in source badge
+                ac_in_src  = r.ac_in_source or "—"
+                ac_in_w    = _fmt(r.ac_in_power_w, 0) if r.ac_in_power_w is not None else "—"
+                ac_out_w   = _fmt(r.ac_out_power_va, 0) if r.ac_out_power_va is not None else "—"
+                batt_a_str = _fmt(r.current_a, 1) if r.current_a is not None else "—"
+                soc_str    = f"{r.capacity_pct}%" if r.capacity_pct is not None else "—"
+                temp_str   = f"{r.temperature_c}°C" if r.temperature_c is not None else "—"
+                err_str    = str(r.vebus_error) if r.vebus_error else "None"
+                alarm_str  = r.alarm_reason or "None"
+                alarm_color = "var(--red)" if r.alarm_reason else "var(--green)"
+                err_color   = "var(--red)" if r.vebus_error else "var(--green)"
+
+                body = (
+                    f'<div class="metrics">'
+                    # Row 1 of metrics: DC voltage | DC current | AC out power
+                    f'<div class="metric"><div class="metric-val v">{_fmt(r.voltage_v, 2)}</div>'
+                    f'<div class="metric-lbl">DC Batt V</div></div>'
+                    f'<div class="metric"><div class="metric-val w">{ac_out_w}</div>'
+                    f'<div class="metric-lbl">AC Out W</div></div>'
+                    f'<div class="metric"><div class="metric-val pv">{ac_in_w}</div>'
+                    f'<div class="metric-lbl">AC In W</div></div>'
+                    f'</div>'
+                    f'<div class="state-row">'
+                    f'<div class="state-kv"><span class="state-k">STATE</span>'
+                    f'<span class="state-v">{state_str}</span></div>'
+                    f'<div class="state-kv"><span class="state-k">SoC</span>'
+                    f'<span class="state-v">{soc_str}</span></div>'
+                    f'<div class="state-kv"><span class="state-k">Batt A</span>'
+                    f'<span class="state-v">{batt_a_str}</span></div>'
+                    f'</div>'
+                    f'<div class="state-row">'
+                    f'<div class="state-kv"><span class="state-k">AC In</span>'
+                    f'<span class="state-v">{ac_in_src}</span></div>'
+                    f'<div class="state-kv"><span class="state-k">Temp</span>'
+                    f'<span class="state-v">{temp_str}</span></div>'
+                    f'<div class="state-kv">'
+                    f'<span class="state-k" style="color:{alarm_color}">ALARM</span>'
+                    f'<span class="state-v" style="color:{alarm_color}">{alarm_str}</span>'
+                    f'</div></div>'
+                    f'{err_note}'
+                )
+
+            # ── Standard inverter (record 0x03/0x07) ──────────────────────────
             else:
-                power_display = "—"
-                power_label   = "AC Out VA"
+                alarm_val   = r.alarm_reason if isinstance(r.alarm_reason, int) else 0
+                alarms      = [lbl for bit, lbl in sorted(_ALARM_BITS.items())
+                               if alarm_val & (1 << bit)]
+                alarm_str   = ", ".join(alarms) if alarms else "None"
+                alarm_color = "var(--red)" if alarms else "var(--green)"
 
-            # AC current row — show calibrated or raw indicator
-            if r.ac_out_current_a is not None:
-                ac_a_display = _fmt(r.ac_out_current_a, 2)
-            elif r.raw_load_indicator is not None:
-                ac_a_display = f"raw={r.raw_load_indicator}"
-            else:
-                ac_a_display = "—"
+                if r.ac_out_power_va is not None:
+                    power_display = _fmt(r.ac_out_power_va, 0)
+                    power_label   = "AC Out W"
+                elif r.raw_load_indicator is not None:
+                    power_display = f"~{r.raw_load_indicator}"
+                    power_label   = "Load (raw)"
+                else:
+                    power_display = "—"
+                    power_label   = "AC Out W"
 
-            body = (
-                f'<div class="metrics">'
-                # DC battery voltage
-                f'<div class="metric">'
-                f'<div class="metric-val v">{_fmt(r.voltage_v, 2)}</div>'
-                f'<div class="metric-lbl">DC Batt V</div>'
-                f'</div>'
-                # AC output power (or raw load indicator)
-                f'<div class="metric">'
-                f'<div class="metric-val w">{power_display}</div>'
-                f'<div class="metric-lbl">{power_label}</div>'
-                f'</div>'
-                # AC output voltage
-                f'<div class="metric">'
-                f'<div class="metric-val pv">{_fmt(r.ac_out_voltage_v, 1)}</div>'
-                f'<div class="metric-lbl">AC Out V</div>'
-                f'</div>'
-                f'</div>'
-                f'<div class="state-row">'
-                f'<div class="state-kv">'
-                f'<span class="state-k">STATE</span>'
-                f'<span class="state-v">{state_str}</span>'
-                f'</div>'
-                f'<div class="state-kv">'
-                f'<span class="state-k">AC Out A</span>'
-                f'<span class="state-v">{ac_a_display}</span>'
-                f'</div>'
-                f'<div class="state-kv">'
-                f'<span class="state-k" style="color:{alarm_color}">ALARM</span>'
-                f'<span class="state-v" style="color:{alarm_color}">{alarm_str}</span>'
-                f'</div>'
-                f'</div>'
-                f'{err_note}'
-            )
+                ac_a_display = (
+                    _fmt(r.ac_out_current_a, 2) if r.ac_out_current_a is not None
+                    else f"raw={r.raw_load_indicator}" if r.raw_load_indicator is not None
+                    else "—"
+                )
+
+                body = (
+                    f'<div class="metrics">'
+                    f'<div class="metric"><div class="metric-val v">{_fmt(r.voltage_v, 2)}</div>'
+                    f'<div class="metric-lbl">DC Batt V</div></div>'
+                    f'<div class="metric"><div class="metric-val w">{power_display}</div>'
+                    f'<div class="metric-lbl">{power_label}</div></div>'
+                    f'<div class="metric"><div class="metric-val pv">{_fmt(r.ac_out_voltage_v, 1)}</div>'
+                    f'<div class="metric-lbl">AC Out V</div></div>'
+                    f'</div>'
+                    f'<div class="state-row">'
+                    f'<div class="state-kv"><span class="state-k">STATE</span>'
+                    f'<span class="state-v">{state_str}</span></div>'
+                    f'<div class="state-kv"><span class="state-k">AC Out A</span>'
+                    f'<span class="state-v">{ac_a_display}</span></div>'
+                    f'<div class="state-kv">'
+                    f'<span class="state-k" style="color:{alarm_color}">ALARM</span>'
+                    f'<span class="state-v" style="color:{alarm_color}">{alarm_str}</span>'
+                    f'</div></div>'
+                    f'{err_note}'
+                )
         elif r.device_type == "monitor":
             # Battery Monitor (SmartShunt / BMV): V, A, SoC, TTG
             soc = r.capacity_pct or 0
