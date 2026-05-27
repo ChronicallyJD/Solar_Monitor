@@ -252,40 +252,53 @@ def _parse_inverter(dec: bytes) -> dict:
     """
     Parse record types 0x03 / 0x06 / 0x07 / 0x0B / 0x0C — Inverter variants.
 
-    Layout confirmed empirically from live Victron inverter packets:
-      [0]    state        (uint8,  inverter state code)
-      [1-2]  alarm_reason (uint16 LE, bitmask)
-      [3-4]  batt_v       (uint16 LE, millivolts — NOTE: mV not 0.01V; 0xFFFF = N/A)
-      [5-6]  ac_va        (uint16 LE, apparent power W/VA; 0xFFFF = N/A)
-      [7-10] bit-packed word (uint32 LE):
-               bits  0-14: ac_voltage  (0.01 V; 0x7FFF = N/A)
-               bits 15-25: ac_current  (0.1 A;  0x7FF  = N/A)
+    Byte-aligned layout confirmed empirically from live packet analysis.
+    Field assignments verified against user-observed values on a 48V/2400W unit:
 
-    Note on battery voltage scaling: the Victron spec document says 0.01 V
-    (int16), but live data analysis shows the field contains millivolts
-    (uint16) for this hardware.  0xAEFF = 44799 mV = 44.799 V matches
-    a slightly-discharged 48 V battery; treating it as int16 * 0.01 gives
-    an impossible -207 V.
+      [0]    state         (uint8,  inverter state code)
+      [1-2]  alarm_reason  (uint16 LE, bitmask)
+      [3-4]  batt_v        (uint16 LE, millivolts — empirically confirmed mV
+                            not 0.01V as the spec states; 0xFFFF = N/A)
+      [5-6]  ac_v_coarse   (uint16 LE, 1V units — coarse AC voltage reading;
+                            used as fallback if fine-grained field is N/A)
+      [7-10] bit-packed uint32 LE:
+               bits  0-14: ac_voltage  (0.01 V per bit; 0x7FFF = N/A)
+               bits 15-25: ac_current  (0.1 A per bit;  0x7FF  = N/A)
+
+    AC apparent power is COMPUTED as ac_voltage * ac_current (no dedicated
+    power field exists in this record type).
+
+    Note on field [5:6]: this is a coarser 1V-resolution reading of the same
+    AC voltage.  It is NOT the AC power field, despite appearing first.
+    The previous version of this parser had these assignments swapped.
     """
     if len(dec) < 7:
         raise ValueError(f"Inverter record too short ({len(dec)}B, need 7)")
-    state     = dec[0]
-    alarm     = struct.unpack_from("<H", dec, 1)[0]
-    batt_mV   = struct.unpack_from("<H", dec, 3)[0]   # uint16, millivolts
-    ac_va_raw = struct.unpack_from("<H", dec, 5)[0]
+    state        = dec[0]
+    alarm        = struct.unpack_from("<H", dec, 1)[0]
+    batt_mV      = struct.unpack_from("<H", dec, 3)[0]   # uint16, millivolts
+    ac_v_coarse  = struct.unpack_from("<H", dec, 5)[0]   # uint16, 1V units
 
     word     = struct.unpack_from("<I", dec, 7)[0] if len(dec) >= 11 else 0
-    ac_v_raw = word & 0x7FFF
-    ac_i_raw = (word >> 15) & 0x7FF
+    ac_v_raw = word & 0x7FFF          # bits 0-14, 0.01V per bit
+    ac_i_raw = (word >> 15) & 0x7FF  # bits 15-25, 0.1A per bit
 
-    batt_v = None if batt_mV  == 0xFFFF else round(batt_mV  * 0.001, 3)
-    ac_va  = None if ac_va_raw == 0xFFFF else float(ac_va_raw)
-    ac_v   = None if ac_v_raw  == 0x7FFF else round(ac_v_raw * 0.01, 2)
-    ac_i   = None if ac_i_raw  == 0x7FF  else round(ac_i_raw * 0.1,  2)
+    batt_v = None if batt_mV     == 0xFFFF else round(batt_mV     * 0.001, 3)
+    # Prefer fine-grained voltage (0.01V); fall back to coarse (1V)
+    if ac_v_raw != 0x7FFF:
+        ac_v = round(ac_v_raw * 0.01, 2)
+    elif ac_v_coarse != 0xFFFF:
+        ac_v = float(ac_v_coarse)
+    else:
+        ac_v = None
+    ac_i = None if ac_i_raw == 0x7FF else round(ac_i_raw * 0.1, 2)
+
+    # Compute apparent power from V * I (no dedicated power field in this record)
+    ac_va = round(ac_v * ac_i, 1) if (ac_v is not None and ac_i is not None) else None
 
     return {
         "voltage_v":        batt_v,
-        "power_w":          ac_va,   # AC apparent power used as the shared power_w field
+        "power_w":          ac_va,
         "ac_out_power_va":  ac_va,
         "ac_out_voltage_v": ac_v,
         "ac_out_current_a": ac_i,
@@ -412,6 +425,7 @@ def read_victron_advertisement(
     friendly_name: Optional[str],
     enc_key: Optional[str],
     all_payloads: Optional[list[bytes]] = None,
+    device_type_override: Optional[str] = None,
 ) -> DeviceReading:
     """
     Decode a Victron BLE advertisement and return a DeviceReading.
@@ -422,24 +436,21 @@ def read_victron_advertisement(
     the device-specific record type can be found even if the generic 0x01
     Solar Charger beacon arrived last.
 
-    Selection algorithm:
-      1. Merge ``all_payloads`` with any payload present in ``adv_data``.
-      2. Sort: device-specific records (non-0x01, higher type number first),
-         then the generic 0x01 beacon as a last resort.
-      3. For each candidate: decrypt, validate state byte (if applicable),
-         validate voltage is in 0–150 V range.
-      4. Use the first candidate that passes all checks.
-
     Args:
-        device:       BLEDevice from the scanner.
-        adv_data:     AdvertisementData from the scanner callback.
-        friendly_name: Dashboard label; falls back to device name or MAC.
-        enc_key:       32-hex advertisement key, or None.
-        all_payloads:  All distinct payloads accumulated for this MAC.
+        device:               BLEDevice from the scanner.
+        adv_data:             AdvertisementData from the scanner callback.
+        friendly_name:        Dashboard label; falls back to device name or MAC.
+        enc_key:              32-hex advertisement key, or None.
+        all_payloads:         All distinct payloads accumulated for this MAC.
+        device_type_override: Explicit device type from config (e.g. "inverter",
+                              "mppt").  When set, payloads whose decoded
+                              device_type does not match are skipped, and the
+                              final reading always carries this type regardless
+                              of which record type was decoded.
 
     Returns:
         DeviceReading with fields populated on success, or with ``error``
-        set on failure (decryption error, wrong key, no data, etc.).
+        set on failure.
     """
     ts   = datetime.now().isoformat(timespec="seconds")
     name = friendly_name or device.name or device.address
@@ -504,12 +515,39 @@ def read_victron_advertisement(
             error="Invalid encryption key: must be exactly 32 hex characters",
         )
 
+    # Build a set of acceptable record types when a type override is declared.
+    # This prevents e.g. a BMV record being used for a configured inverter.
+    _TYPE_TO_RECORDS: dict[str, set[int]] = {
+        "mppt":     {0x01},
+        "monitor":  {0x02, 0x08},
+        "inverter": {0x03, 0x06, 0x07, 0x0B, 0x0C},
+        "dcdc":     {0x04, 0x09, 0x0D},
+        "lithium":  {0x05},
+        "meter":    {0x07},
+    }
+    allowed_records: Optional[set[int]] = None
+    if device_type_override:
+        allowed_records = _TYPE_TO_RECORDS.get(device_type_override)
+        if allowed_records is None:
+            log.warning(
+                f"  [Victron] {name}: unknown type override "
+                f"'{device_type_override}' — ignoring"
+            )
+
     # ── Try each candidate until one decrypts successfully ───────────────────
     last_error = "no candidate payload decrypted successfully"
 
     for payload in candidates:
         record_type, nonce_val, ciphertext = parse_payload(payload)
         if record_type == 0xFF or not ciphertext:
+            continue
+
+        # Skip records that don't match the declared device type
+        if allowed_records is not None and record_type not in allowed_records:
+            log.debug(
+                f"  [Victron] {name}: rec=0x{record_type:02X} skipped "
+                f"(config declares type={device_type_override})"
+            )
             continue
 
         parser = PARSERS.get(record_type)
@@ -587,6 +625,9 @@ def read_victron_advertisement(
 
         # ── Success ───────────────────────────────────────────────────────────
         label, dtype = VICTRON_RECORD_TYPES.get(record_type, ("Victron", "victron"))
+        # Config-declared type overrides the record-type inferred type
+        if device_type_override:
+            dtype = device_type_override
         r = DeviceReading(
             address=device.address, name=name,
             device_type=dtype, timestamp=ts,

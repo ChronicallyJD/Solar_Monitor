@@ -84,7 +84,7 @@ theme           = dark
 
 # ── Victron devices ──────────────────────────────────────────────────────────
 # Accepts [victron] or [mppt] as the section name.
-# Each entry is:   Friendly Name = MAC_ADDRESS [ : ADVERTISEMENT_KEY ]
+# Each entry is:   Friendly Name = MAC : KEY [ type=TYPE ]
 #
 # The 32-hex-character AES-128 Advertisement key comes from VictronConnect:
 #   Connect to device -> gear icon -> Product info
@@ -92,26 +92,39 @@ theme           = dark
 #   -> copy the "Advertisement key"
 #   (NOT the "Encryption key" shown higher up on the same screen)
 #
-# Two separator formats are accepted:
+# Optional  type=  declaration pins the device to a specific role.
+# Without it, the type is inferred from the BLE record type, which can be
+# unreliable when VE.Smart networking is active (devices share each other's
+# data on the network, causing record-type confusion).
+#
+# Valid types: mppt | inverter | monitor | dcdc | lithium | meter
+#
+# Two separator formats for the MAC:KEY pair:
 #   No spaces:   Name = AA:BB:CC:DD:EE:FF:aabbccddeeff00112233445566778899
 #   With spaces: Name = AA:BB:CC:DD:EE:FF : aabbccddeeff00112233445566778899
+#
+# Full examples:
+#   (1)-14-130V  = DD:1B:7E:A7:91:83:613f9fd95d3633385cf49d32a9d551e3 type=mppt
+#   (3)-12-180V  = E1:2D:6C:B5:83:76:2bbad134f666e8f1f23e510584af3450 type=mppt
+#   48V-2400W    = E6:2E:31:75:9A:1A:dd15693279172720da3ecb1d2e4e7da1 type=inverter
 #
 # If this section is absent the script auto-discovers Victron devices.
 
 [victron]
-# Roof MPPT   = DD:1B:7E:A7:91:83 : 613f9fd95d3633385cf49d32a9d551e3
-# Inverter    = E6:2E:31:75:9A:1A : dd15693279172720da3ecb1d2e4e7da1
+# (1)-14-130V  = DD:1B:7E:A7:91:83:613f9fd95d3633385cf49d32a9d551e3 type=mppt
+# 48V-2400W    = E6:2E:31:75:9A:1A:dd15693279172720da3ecb1d2e4e7da1 type=inverter
 """
 
 
 @dataclass
 class DeviceConfig:
     """Parsed configuration for a single monitored device."""
-    name:     str             # friendly label shown in the dashboard
-    mac:      Optional[str]   # normalised upper-case MAC (AA:BB:CC:DD:EE:FF) or None
-    ble_name: Optional[str]   # BLE advertisement name to match (BMS only); None if using MAC
-    enc_key:  Optional[str]   # 32-hex Victron advertisement key; None if not configured
-    password: Optional[str]   # JBD BMS connection password; None if not required
+    name:        str             # friendly label shown in the dashboard
+    mac:         Optional[str]   # normalised upper-case MAC or None
+    ble_name:    Optional[str]   # BLE advertisement name to match (BMS only)
+    enc_key:     Optional[str]   # 32-hex Victron advertisement key
+    password:    Optional[str]   # JBD BMS connection password
+    device_type: Optional[str]   = None  # explicit type override: "mppt"|"inverter"|"monitor"|"dcdc"
 
 
 @dataclass
@@ -155,31 +168,40 @@ def is_mac(value: str) -> bool:
     return len(v) == 12 and all(c in "0123456789ABCDEF" for c in v)
 
 
-def parse_mac_key(value: str) -> tuple[str, Optional[str]]:
+def parse_mac_key(value: str) -> tuple[str, Optional[str], Optional[str]]:
     """
-    Parse a Victron INI value into (mac, advertisement_key).
+    Parse a Victron INI value into (mac, advertisement_key, device_type).
 
     Supported formats::
 
         AA:BB:CC:DD:EE:FF                               # MAC only
         AA:BB:CC:DD:EE:FF : aabbccddeeff0011...         # MAC + key (spaced)
         AA:BB:CC:DD:EE:FF:aabbccddeeff0011...           # MAC + key (no spaces)
+        AA:BB:CC:DD:EE:FF:aabbcc... type=inverter       # MAC + key + explicit type
+        AA:BB:CC:DD:EE:FF type=mppt                     # MAC + type, no key
 
-    The spaced " : " separator is unambiguous.  The no-space form is handled
-    by splitting on ":" and checking that exactly 7 segments are present (6
-    MAC bytes + 1 key segment).
+    Valid device_type values: mppt, inverter, monitor, dcdc, lithium, meter.
+    If omitted, the type is inferred from the BLE record type at runtime.
 
     Returns:
-        (normalised_mac, key_hex_or_None)
+        (normalised_mac, key_hex_or_None, device_type_or_None)
     """
     value = value.strip()
+
+    # Extract optional type= declaration before further parsing
+    device_type: Optional[str] = None
+    if " type=" in value:
+        value, type_part = value.rsplit(" type=", 1)
+        device_type = type_part.strip().lower() or None
+        value = value.strip()
+
     if " : " in value:
         mac_part, key_part = value.split(" : ", 1)
-        return normalise_mac(mac_part.strip()), key_part.strip() or None
+        return normalise_mac(mac_part.strip()), key_part.strip() or None, device_type
     parts = value.split(":")
     if len(parts) == 7:
-        return normalise_mac(":".join(parts[:6])), parts[6].strip() or None
-    return normalise_mac(value), None
+        return normalise_mac(":".join(parts[:6])), parts[6].strip() or None, device_type
+    return normalise_mac(value), None, device_type
 
 
 def parse_bms_value(value: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -272,12 +294,15 @@ def load_config(ini_path: Optional[str]) -> AppConfig:
     if victron_section:
         cfg.auto_discover_mppt = False
         for name, value in victron_section.items():
-            mac, key = parse_mac_key(value)
+            mac, key, dtype = parse_mac_key(value)
             label    = name.title()
+            type_str = f" type={dtype}" if dtype else ""
             log.info(f"  Victron '{label}' -> {mac}"
-                     + (" (key set)" if key else " (no key)"))
+                     + (" (key set)" if key else " (no key)")
+                     + type_str)
             cfg.mppt_devices.append(DeviceConfig(
-                name=label, mac=mac, ble_name=None, enc_key=key, password=None
+                name=label, mac=mac, ble_name=None, enc_key=key,
+                password=None, device_type=dtype,
             ))
 
     return cfg
@@ -312,9 +337,10 @@ def apply_cli_overrides(cfg: AppConfig, args: argparse.Namespace) -> AppConfig:
         cfg.auto_discover_mppt = False
         cfg.mppt_devices = []
         for entry in args.mppt:
-            mac, key = parse_mac_key(entry)
+            mac, key, dtype = parse_mac_key(entry)
             cfg.mppt_devices.append(DeviceConfig(
-                name=mac, mac=mac, ble_name=None, enc_key=key, password=None
+                name=mac, mac=mac, ble_name=None, enc_key=key,
+                password=None, device_type=dtype,
             ))
 
     return cfg

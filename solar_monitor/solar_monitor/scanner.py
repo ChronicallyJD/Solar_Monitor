@@ -270,14 +270,14 @@ async def resolve_devices(cfg: AppConfig) -> tuple[list, list, PersistentScanner
                         )
                         break
             if entry:
-                mppt_triples.append((entry[0], entry[1], dc.name, dc.enc_key))
+                mppt_triples.append((entry[0], entry[1], dc.name, dc.enc_key, dc.device_type))
             else:
                 log.warning(
                     f"  [Victron] '{dc.name}' "
                     f"({dc.mac or dc.ble_name}) not seen in scan"
                 )
                 mppt_triples.append(
-                    (None, None, dc.name, dc.mac or dc.ble_name or "unknown")
+                    (None, None, dc.name, dc.mac or dc.ble_name or "unknown", dc.device_type)
                 )
 
     # ── Auto-discovery ────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ async def resolve_devices(cfg: AppConfig) -> tuple[list, list, PersistentScanner
             or VICTRON_MFR_ID in (getattr(adv, "manufacturer_data", {}) or {})
         ):
             key = mppt_key_by_mac.get(mac) or mppt_key_by_name.get(name_lower)
-            mppt_triples.append((dev, adv, dev.name or mac, key))
+            mppt_triples.append((dev, adv, dev.name or mac, key, None))
             log.info(f"  [Victron] Auto-discovered: {dev.name or mac} ({mac})"
                      + (" (key set)" if key else ""))
 
@@ -393,19 +393,22 @@ async def poll_all(
     mppt_readings: list[DeviceReading] = []
     for entry in mppt_triples:
         if entry[0] is None:
-            _, _, name, ident = entry
+            _, _, name, ident, *_ = entry
             mppt_readings.append(DeviceReading(
                 address=ident, name=name, device_type="mppt",
                 timestamp=datetime.now().isoformat(timespec="seconds"),
                 error="Device not found during scan",
             ))
         else:
-            dev, adv_snapshot, name, key = entry
+            dev, adv_snapshot, name, key, dtype = entry
             all_payloads = scanner.victron_payloads(dev.address)
             fresh        = scanner.latest_adv(dev.address)
             adv          = fresh[1] if fresh else adv_snapshot
             mppt_readings.append(
-                read_victron_advertisement(dev, adv, name, key, all_payloads)
+                read_victron_advertisement(
+                    dev, adv, name, key, all_payloads,
+                    device_type_override=dtype,
+                )
             )
 
     # All BLE work complete — release the radio

@@ -6,15 +6,23 @@ interval        = 30
 scan_timeout    = 10
 max_history     = 60
 log_level       = INFO
-theme           = business
+theme           = business        # dark | light | business
 
 [bms]
 # Name = MAC_OR_BLE_NAME [ : password ]
-# Batt0 = DXDD00202J-117
+# BATT0 = DXDD00202J-117
+# BATT1 = AA:BB:CC:DD:EE:01 : 0000
 
 [victron]
-# Name = MAC : 32-hex-advertisement-key
-# (from VictronConnect: device > gear > Product info >
-#  Instant Readout via Bluetooth > Show > Advertisement key)
-# MPPT    = DD:1B:7E:A7:91:83 : 613f9fd95d3633385cf49d32a9d551e3
-# Inverter = E6:2E:31:75:9A:1A : dd15693279172720da3ecb1d2e4e7da1
+# Name = MAC : 32-hex-advertisement-key [ type=TYPE ]
+#
+# type= pins the device to a role, preventing misidentification when
+# VE.Smart networking is active. Valid values: mppt | inverter | monitor | dcdc
+#
+# Get the key from VictronConnect:
+#   connect > gear icon > Product info > Instant Readout via Bluetooth > Show
+#   Copy the "Advertisement key" (NOT the "Encryption key" above it)
+#
+# (1)-14-130V = DD:1B:7E:A7:91:83:613f9fd95d3633385cf49d32a9d551e3 type=mppt
+# (3)-12-180V = E1:2D:6C:B5:83:76:2bbad134f666e8f1f23e510584af3450 type=mppt
+# 48V-2400W   = E6:2E:31:75:9A:1A:dd15693279172720da3ecb1d2e4e7da1 type=inverter
